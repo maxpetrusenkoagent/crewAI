@@ -962,7 +962,12 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             }
             self._restored_from_checkpoint = True
         if self.checkpoint_method_outputs is not None:
-            self._method_outputs = list(self.checkpoint_method_outputs)
+            self._method_outputs = [
+                entry
+                if isinstance(entry, dict) and "method" in entry and "output" in entry
+                else {"method": "", "output": entry}
+                for entry in self.checkpoint_method_outputs
+            ]
         if self.checkpoint_method_counts is not None:
             self._method_execution_counts = {
                 FlowMethodName(k): v for k, v in self.checkpoint_method_counts.items()
