@@ -10,6 +10,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import threading
 import time
 from typing import (
     TYPE_CHECKING,
@@ -937,33 +938,47 @@ class Agent(BaseAgent):
             The output of the agent.
 
         Raises:
-            TimeoutError: If execution exceeds the timeout.
+            TimeoutError: If execution exceeds the timeout. The timed-out
+                execution cannot be cancelled (Python threads cannot be
+                killed); it is abandoned and may finish in the background.
             RuntimeError: If execution fails for other reasons.
         """
         ctx = contextvars.copy_context()
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(
-                ctx.run,
-                self._execute_without_timeout,
-                task_prompt=task_prompt,
-                task=task,
-            )
+        future: concurrent.futures.Future[Any] = concurrent.futures.Future()
 
+        def run_with_future() -> None:
             try:
-                return future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError as e:
-                future.cancel()
-                raise TimeoutError(
-                    f"Task '{task.description}' execution timed out after {timeout} seconds. Consider increasing max_execution_time or optimizing the task."
-                ) from e
-            except _passthrough_exceptions:
-                # Wrapping a deliberate stop in RuntimeError would hide it from
-                # _check_execution_error and trigger the retry loop instead.
-                future.cancel()
-                raise
-            except Exception as e:
-                future.cancel()
-                raise RuntimeError(f"Task execution failed: {e!s}") from e
+                result = self._execute_without_timeout(
+                    task_prompt=task_prompt, task=task
+                )
+            except BaseException as e:
+                future.set_exception(e)
+            else:
+                future.set_result(result)
+
+        # A daemon thread, not an executor: once the timeout fires the caller
+        # walks away while the worker may still be blocked inside the very
+        # hang the timeout bounds. Threads cannot be cancelled, so the
+        # abandoned call finishes (or not) in the background; marking the
+        # thread daemon keeps interpreter exit from parking on it.
+        threading.Thread(
+            target=ctx.run,
+            args=(run_with_future,),
+            daemon=True,
+        ).start()
+
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as e:
+            raise TimeoutError(
+                f"Task '{task.description}' execution timed out after {timeout} seconds. Consider increasing max_execution_time or optimizing the task."
+            ) from e
+        except _passthrough_exceptions:
+            # Wrapping a deliberate stop in RuntimeError would hide it from
+            # _check_execution_error and trigger the retry loop instead.
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Task execution failed: {e!s}") from e
 
     def _execute_without_timeout(self, task_prompt: str, task: Task) -> Any:
         """Execute a task without a timeout.

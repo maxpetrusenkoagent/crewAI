@@ -3,6 +3,7 @@
 import ast
 import json
 import os
+import threading
 import time
 from functools import partial
 from hashlib import md5
@@ -1568,10 +1569,15 @@ def test_task_with_max_execution_time_exceeded():
 
     """Test that execution raises TimeoutError when max_execution_time is exceeded."""
 
+    release = threading.Event()
+
     @tool("what amazing tool", result_as_answer=True)
     def my_tool() -> str:
         "My tool"
-        time.sleep(10)
+        # A blocked tool: the execution cannot finish within the 1s budget on
+        # its own. Release it once the assertion completes so the worker the
+        # timeout walks away from does not stay parked behind a long sleep.
+        release.wait(timeout=30)
         return "okay"
 
     researcher = Agent(
@@ -1592,8 +1598,21 @@ def test_task_with_max_execution_time_exceeded():
         agent=researcher,
     )
 
-    with pytest.raises(TimeoutError):
-        task.execute_sync(agent=researcher)
+    try:
+        with pytest.raises(TimeoutError):
+            task.execute_sync(agent=researcher)
+    finally:
+        release.set()
+
+    # The timeout walks away from the blocked execution; wait for the
+    # abandoned run to finish so this test does not leave a live flow behind
+    # for process teardown to trip over.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        executor = researcher.agent_executor
+        if executor is None or not getattr(executor, "_is_executing", False):
+            break
+        time.sleep(0.05)
 
 
 @pytest.mark.vcr()
